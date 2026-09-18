@@ -3,7 +3,9 @@
 All filesystem-only: no network, and every rclone interaction is mocked.
 """
 
+import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -501,11 +503,17 @@ def test_test_mode_reports_an_unusable_archive_as_a_plain_stop(vault, tmp_path, 
     write_config(vault, destination=str(dest))
     assert backup_vault.run_backup(vault) == 0
 
-    code = restore_vault.main(["test", "--source", str(dest), "--vault", str(vault)])
+    report_path = tmp_path / "test-report.json"
+    code = restore_vault.main(["test", "--source", str(dest),
+                               "--vault", str(vault),
+                               "--report", str(report_path)])
     out = capsys.readouterr().out
     assert code == 1, "an unrestorable set must not report a successful test"
     assert "Stopped:" in out and "could not be unpacked" in out
     assert "Traceback" not in out
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "stopped"
+    assert report["error"]["code"] == "unsafe_link"
 
 
 def test_a_damaged_newest_set_points_at_the_newest_intact_one(vault, tmp_path):
@@ -541,6 +549,406 @@ def test_escaping_link_detection_accepts_links_that_stay_inside(vault, tmp_path)
     write_config(vault, destination=str(dest))
     assert backup_vault.run_backup(vault) == 0
     assert read_stamp(vault)["warnings"] == []
+
+
+# --- hardened, member-by-member safe extraction ------------------------------
+#
+# A restore runs on the least-controlled machine in the system (a new one)
+# against the least-controlled input (an archive that sat in a synced
+# folder). These tests craft archives directly so the dangerous shapes never
+# depend on what the honest backup engine would produce.
+
+def _add_dir(tar, name, mode=0o755):
+    info = tarfile.TarInfo(name if name.endswith("/") else name + "/")
+    info.type = tarfile.DIRTYPE
+    info.mode = mode
+    info.mtime = 1700000000
+    tar.addfile(info)
+
+
+def _add_file(tar, name, data=b"x", mode=0o644, typ=tarfile.REGTYPE):
+    info = tarfile.TarInfo(name)
+    info.type = typ
+    info.mode = mode
+    info.mtime = 1700000000
+    info.size = len(data)
+    tar.addfile(info, io.BytesIO(data))
+
+
+def _add_sym(tar, name, target, mode=0o777):
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.SYMTYPE
+    info.mode = mode
+    info.mtime = 1700000000
+    info.linkname = target
+    tar.addfile(info)
+
+
+def _add_hard(tar, name, target):
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.LNKTYPE
+    info.mode = 0o644
+    info.mtime = 1700000000
+    info.linkname = target
+    tar.addfile(info)
+
+
+def _crafted_archive(tmp_path, build):
+    archive = tmp_path / "crafted.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        build(tar)
+    return archive
+
+
+def test_safe_extract_stages_files_links_and_modes_then_verifies(tmp_path):
+    def build(tar):
+        _add_dir(tar, "dex-vault/")
+        _add_dir(tar, "dex-vault/notes/")
+        _add_file(tar, "dex-vault/notes/a.md", b"# Ada\n", mode=0o600)
+        _add_file(tar, "dex-vault/run", b"#!/bin/sh\n", mode=0o755)
+        _add_sym(tar, "dex-vault/alias", "notes/a.md")
+        _add_file(tar, "dex-vault/orig", b"same bytes\n")
+        _add_hard(tar, "dex-vault/twin", "dex-vault/orig")
+
+    archive = _crafted_archive(tmp_path, build)
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    result = restore_vault.safe_extract(archive, staging)
+
+    assert result["counts"] == {"members": 7, "files": 3, "directories": 2,
+                                "symlinks": 1, "hardlinks": 1}
+    note = staging / "dex-vault" / "notes" / "a.md"
+    assert note.read_bytes() == b"# Ada\n"
+    assert note.stat().st_mode & 0o777 == 0o600
+    run = staging / "dex-vault" / "run"
+    assert run.stat().st_mode & 0o100 == 0o100
+    alias = staging / "dex-vault" / "alias"
+    assert alias.is_symlink() and os.readlink(alias) == "notes/a.md"
+    orig = staging / "dex-vault" / "orig"
+    twin = staging / "dex-vault" / "twin"
+    assert (orig.stat().st_dev, orig.stat().st_ino) \
+        == (twin.stat().st_dev, twin.stat().st_ino)
+    assert result["files_verified"] == 3
+    note_record = next(e for e in result["entries"]
+                       if e["path"] == "dex-vault/notes/a.md")
+    assert note_record["sha256"] == backup_vault.file_digest(note)
+    assert result["bytes"] == len(b"# Ada\n") + len(b"#!/bin/sh\n") \
+        + len(b"same bytes\n")
+
+
+def _build_parent_traversal(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_file(tar, "dex-vault/../evil", b"x")
+
+
+def _build_absolute_name(tar):
+    _add_file(tar, "/dex-vault/evil", b"x")
+
+
+def _build_backslash_name(tar):
+    _add_file(tar, "dex-vault/back\\slash", b"x")
+
+
+def _build_outside_prefix(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_file(tar, "other/x", b"x")
+
+
+def _build_char_device(tar):
+    _add_dir(tar, "dex-vault/")
+    info = tarfile.TarInfo("dex-vault/null")
+    info.type = tarfile.CHRTYPE
+    info.mode = 0o20666
+    info.devmajor, info.devminor = 0o1, 0o3
+    info.mtime = 1700000000
+    tar.addfile(info)
+
+
+def _build_fifo(tar):
+    _add_dir(tar, "dex-vault/")
+    info = tarfile.TarInfo("dex-vault/pipe")
+    info.type = tarfile.FIFOTYPE
+    info.mode = 0o644
+    info.mtime = 1700000000
+    tar.addfile(info)
+
+
+def _build_absolute_symlink(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_sym(tar, "dex-vault/link", "/etc/passwd")
+
+
+def _build_escaping_symlink(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_dir(tar, "dex-vault/sub/")
+    _add_sym(tar, "dex-vault/sub/link", "../../../outside")
+
+
+def _build_backslash_symlink(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_sym(tar, "dex-vault/link", "..\\evil")
+
+
+def _build_forward_hardlink(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_hard(tar, "dex-vault/h", "dex-vault/missing")
+
+
+def _build_duplicate(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_file(tar, "dex-vault/same", b"one")
+    _add_file(tar, "dex-vault/same", b"two")
+
+
+def _build_file_under_file(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_file(tar, "dex-vault/a", b"x")
+    _add_file(tar, "dex-vault/a/b", b"x")
+
+
+def _build_through_symlinked_dir(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_sym(tar, "dex-vault/portal", ".")
+    _add_file(tar, "dex-vault/portal/evil", b"x")
+
+
+def _build_top_level_file(tar):
+    _add_file(tar, "dex-vault", b"x")
+
+
+@pytest.mark.parametrize("build,code", [
+    (_build_parent_traversal, "unsafe_member_name"),
+    (_build_absolute_name, "unsafe_member_name"),
+    (_build_backslash_name, "unsafe_member_name"),
+    (_build_outside_prefix, "unsafe_member_name"),
+    (_build_top_level_file, "unsafe_member_name"),
+    (_build_char_device, "unsafe_member_type"),
+    (_build_fifo, "unsafe_member_type"),
+    (_build_absolute_symlink, "unsafe_link"),
+    (_build_escaping_symlink, "unsafe_link"),
+    (_build_backslash_symlink, "unsafe_link"),
+    (_build_forward_hardlink, "unsafe_link"),
+    (_build_duplicate, "duplicate_member"),
+    (_build_file_under_file, "conflicting_member"),
+    (_build_through_symlinked_dir, "conflicting_member"),
+])
+def test_unsafe_archives_are_rejected_and_stage_is_emptied(tmp_path, build, code):
+    archive = _crafted_archive(tmp_path, build)
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    with pytest.raises(restore_vault.RestoreError) as raised:
+        restore_vault.safe_extract(archive, staging)
+    assert raised.value.code == code
+    assert "could not be unpacked" in str(raised.value)
+    # Nothing landed in staging, and nothing escaped next to it.
+    assert list(staging.iterdir()) == []
+    assert not (tmp_path / "evil").exists()
+    assert not (tmp_path / "outside").exists()
+
+
+def test_an_inside_symlink_and_parent_dot_target_are_accepted(tmp_path):
+    def build(tar):
+        _add_dir(tar, "dex-vault/")
+        _add_dir(tar, "dex-vault/notes/")
+        _add_file(tar, "dex-vault/notes/a.md", b"# Ada\n")
+        # lexical . and ../notes stay inside the staging root
+        _add_sym(tar, "dex-vault/notes/here", ".")
+        _add_sym(tar, "dex-vault/again", "notes/../notes/a.md")
+
+    archive = _crafted_archive(tmp_path, build)
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    result = restore_vault.safe_extract(archive, staging)
+    assert result["counts"]["symlinks"] == 2
+
+
+def test_staged_tampering_fails_verification(tmp_path):
+    def build(tar):
+        _add_dir(tar, "dex-vault/")
+        _add_file(tar, "dex-vault/note.md", b"original\n")
+
+    archive = _crafted_archive(tmp_path, build)
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    planned = restore_vault.plan_extraction(archive)
+    manifest, _counts, _bytes, _warnings = restore_vault._materialize(
+        archive, staging, planned)
+    (staging / "dex-vault" / "note.md").write_text("tampered\n")
+    with pytest.raises(restore_vault.RestoreError) as raised:
+        restore_vault._verify_staged_tree(staging, manifest)
+    assert raised.value.code == "verify_mismatch"
+
+
+def test_an_extra_file_in_staging_fails_verification(tmp_path):
+    def build(tar):
+        _add_dir(tar, "dex-vault/")
+        _add_file(tar, "dex-vault/note.md", b"original\n")
+
+    archive = _crafted_archive(tmp_path, build)
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    planned = restore_vault.plan_extraction(archive)
+    manifest, _counts, _bytes, _warnings = restore_vault._materialize(
+        archive, staging, planned)
+    (staging / "intruder").write_text("not from the archive")
+    with pytest.raises(restore_vault.RestoreError, match="not accounted for"):
+        restore_vault._verify_staged_tree(staging, manifest)
+
+
+def test_restore_keeps_links_that_stay_inside_and_writes_an_ok_report(
+        vault, tmp_path):
+    (vault / "shortcut.md").symlink_to("05-Areas/People/Ada_Lovelace.md")
+    dest = tmp_path / "backups"
+    write_config(vault, destination=str(dest))
+    assert backup_vault.run_backup(vault) == 0
+    stamp = read_stamp(vault)["set"]
+
+    target = tmp_path / "restored"
+    restore_vault.restore(dest, stamp, target, vault)
+    link = target / backup_vault.ARCNAME / "shortcut.md"
+    assert link.is_symlink()
+    assert os.readlink(link) == "05-Areas/People/Ada_Lovelace.md"
+    assert link.read_text() == "# Ada\n"
+
+    report_path = target.parent / f".{target.name}.restore-report-{stamp}.json"
+    report = json.loads(report_path.read_text())
+    assert report["schema"] == restore_vault.REPORT_SCHEMA
+    assert report["status"] == "ok"
+    assert report["error"] is None
+    assert report["files_verified"] >= 1
+    shortcut = next(e for e in report["entries"]
+                    if e["path"].endswith("shortcut.md"))
+    assert shortcut["type"] == "symlink"
+    assert shortcut["target"] == "05-Areas/People/Ada_Lovelace.md"
+
+
+def test_an_unsafe_set_leaves_no_target_and_writes_a_stopped_report(
+        vault, tmp_path):
+    (tmp_path / "outside.md").write_text("elsewhere")
+    (vault / "linked.md").symlink_to(tmp_path / "outside.md")
+    dest = tmp_path / "backups"
+    write_config(vault, destination=str(dest))
+    assert backup_vault.run_backup(vault) == 0
+    stamp = read_stamp(vault)["set"]
+
+    target = tmp_path / "restored"
+    with pytest.raises(restore_vault.RestoreError, match="could not be unpacked"):
+        restore_vault.restore(dest, stamp, target, vault)
+    assert not target.exists()
+    leftover = [p for p in target.parent.glob(f".{target.name}.restore-*")
+                if not p.name.endswith(".json")]
+    assert leftover == [], "a staging folder was left behind"
+    report_path = target.parent / f".{target.name}.restore-report-{stamp}.json"
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "stopped"
+    assert report["error"]["code"] == "unsafe_link"
+
+
+def test_restore_publishes_into_an_empty_existing_folder(backed_up, tmp_path):
+    vault_root, dest, stamp = backed_up
+    target = tmp_path / "restored"
+    target.mkdir()
+    restore_vault.restore(dest, stamp, target, vault_root)
+    assert (target / backup_vault.ARCNAME / "05-Areas" / "People"
+            / "Ada_Lovelace.md").read_text() == "# Ada\n"
+
+
+def test_test_mode_writes_a_machine_report_only_when_asked(
+        backed_up, tmp_path, capsys):
+    vault_root, dest, _stamp = backed_up
+    report_path = tmp_path / "report.json"
+    code = restore_vault.main(["test", "--source", str(dest),
+                               "--vault", str(vault_root),
+                               "--report", str(report_path)])
+    assert code == 0
+    report = json.loads(report_path.read_text())
+    assert report["mode"] == "test"
+    assert report["status"] == "ok"
+    assert report["target"] is None
+    assert report["files_verified"] >= 1
+    assert "Test restore succeeded" in capsys.readouterr().out
+
+
+def test_a_truncated_archive_is_rejected_and_stage_is_emptied(tmp_path):
+    def build(tar):
+        _add_dir(tar, "dex-vault/")
+        _add_file(tar, "dex-vault/note.md", b"original bytes\n" * 100)
+
+    archive = _crafted_archive(tmp_path, build)
+    archive.write_bytes(archive.read_bytes()[:-120])  # cut the gzip stream
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    with pytest.raises(restore_vault.RestoreError) as raised:
+        restore_vault.safe_extract(archive, staging)
+    assert raised.value.code == "archive_error"
+    assert list(staging.iterdir()) == []
+
+
+def test_bundle_is_staged_alongside_and_checksum_verified(tmp_path):
+    def build(tar):
+        _add_dir(tar, "dex-vault/")
+        _add_file(tar, "dex-vault/note.md", b"x")
+
+    archive = _crafted_archive(tmp_path, build)
+    bundle = tmp_path / "dex-vault-stamp.bundle"
+    bundle.write_bytes(b"git bundle bytes\n")
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    result = restore_vault.safe_extract(archive, staging, bundle)
+    assert (staging / bundle.name).read_bytes() == b"git bundle bytes\n"
+    assert result["bundle"]["name"] == bundle.name
+    record = next(e for e in result["entries"] if e["path"] == bundle.name)
+    assert record["role"] == "history-bundle"
+    assert record["sha256"] == backup_vault.file_digest(bundle)
+
+
+def _build_absolute_hardlink(tar):
+    _add_dir(tar, "dex-vault/")
+    _add_hard(tar, "dex-vault/h", "/etc/passwd")
+
+
+def test_an_absolute_hardlink_target_is_rejected(tmp_path):
+    archive = _crafted_archive(tmp_path, _build_absolute_hardlink)
+    staging = tmp_path / "stage"
+    staging.mkdir()
+    with pytest.raises(restore_vault.RestoreError) as raised:
+        restore_vault.safe_extract(archive, staging)
+    assert raised.value.code == "unsafe_link"
+
+
+def test_a_publish_failure_writes_a_stopped_report(backed_up, tmp_path,
+                                                   monkeypatch):
+    vault_root, dest, stamp = backed_up
+    target = tmp_path / "restored"
+
+    def refuse_replace(src, dst):
+        # Only block the staging -> target rename; let the report's atomic
+        # write (.partial swap) through.
+        if ".restore-report" not in str(src):
+            raise OSError("simulated rename failure")
+        return real_replace(src, dst)
+
+    real_replace = restore_vault.os.replace
+    monkeypatch.setattr(restore_vault.os, "replace", refuse_replace)
+    with pytest.raises(restore_vault.RestoreError) as raised:
+        restore_vault.restore(dest, stamp, target, vault_root)
+    assert raised.value.code == "publish_failed"
+    assert not target.exists()
+    assert not list(target.parent.glob(f".{target.name}.restore-*")) or \
+        all(p.suffix == ".json" for p in target.parent.glob(
+            f".{target.name}.restore-*"))
+    report_path = target.parent / f".{target.name}.restore-report-{stamp}.json"
+    report = json.loads(report_path.read_text())
+    assert report["status"] == "stopped"
+    assert report["error"]["code"] == "publish_failed"
+
+
+def test_restore_without_to_prints_a_plain_stop(backed_up, capsys):
+    vault_root, dest, _stamp = backed_up
+    code = restore_vault.main(["restore", "--source", str(dest),
+                               "--vault", str(vault_root)])
+    assert code == 1
+    assert "needs --to" in capsys.readouterr().out
 
 
 # --- secrets must never reach a synced folder -------------------------------

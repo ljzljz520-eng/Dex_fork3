@@ -42,6 +42,18 @@ never contain plaintext keys.
 4. Inspect the restored copy, then move it into place yourself. No Dex tool
    ever overwrites a live vault.
 
+The tool unpacks safely on any Python version without trusting the system
+tar: it refuses absolute or path-traversing entry names, device files and
+pipes, links that point outside the restore folder, duplicate entries, and
+any unexpected member type. Everything is extracted into a private staging
+folder first, fsynced, then re-read from disk and checksum-verified against
+the archive's entry-by-entry manifest; only after that is the folder moved
+to the target you chose. Each restore also writes a machine-readable report
+(`.<target>.restore-report-<stamp>.json` next to the target, or a path you
+choose with `--report`) listing every file and its SHA-256; on a refusal it
+records `status: stopped` with an error code instead, and nothing is moved.
+Prefer this tool over plain `tar -xzf` on a machine you do not fully trust.
+
 ## What you must re-establish by hand
 
 Three categories, none of which any archive can carry:
